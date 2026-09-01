@@ -1,0 +1,411 @@
+/* USER CODE BEGIN Header */
+/**
+  ******************************************************************************
+  * @file    app_usbx_device.c
+  * @author  MCD Application Team
+  * @brief   USBX Device applicative file
+  ******************************************************************************
+  * @attention
+  *
+  * Copyright (c) 2024 STMicroelectronics.
+  * All rights reserved.
+  *
+  * This software is licensed under terms that can be found in the LICENSE file
+  * in the root directory of this software component.
+  * If no LICENSE file comes with this software, it is provided AS-IS.
+  *
+  ******************************************************************************
+  */
+/* USER CODE END Header */
+
+/* USER CODE BEGIN 1 */
+
+/* USER CODE END 1 */
+
+/* Includes ------------------------------------------------------------------*/
+#include "app_usbx.h"
+#include "ux_device_stack.h"
+#include "ux_system.h"
+#include <stdio.h>
+
+/* Private includes ----------------------------------------------------------*/
+/* USER CODE BEGIN Includes */
+
+/* USER CODE END Includes */
+
+/* Private typedef -----------------------------------------------------------*/
+/* USER CODE BEGIN PTD */
+
+/* USER CODE END PTD */
+
+/* Private define ------------------------------------------------------------*/
+/* USER CODE BEGIN PD */
+/* USER CODE END PD */
+
+/* Private macro -------------------------------------------------------------*/
+/* USER CODE BEGIN PM */
+
+/* USER CODE END PM */
+
+/* Private variables ---------------------------------------------------------*/
+
+static ULONG cdc_ecm_interface_number;
+static ULONG cdc_ecm_configuration_number;
+static UCHAR cdc_ecm_local_nodeid[UX_DEVICE_CLASS_CDC_ECM_NODE_ID_LENGTH];
+static UCHAR cdc_ecm_remote_nodeid[UX_DEVICE_CLASS_CDC_ECM_NODE_ID_LENGTH];
+static UX_SLAVE_CLASS_CDC_ECM_PARAMETER cdc_ecm_parameter;
+static TX_THREAD ux_device_app_thread;
+extern PCD_HandleTypeDef hpcd_USB_OTG_HS;
+
+/* Some Linux hosts (cdc_ether) never issue SET_INTERFACE to switch the CDC-ECM
+   data interface to its active alternate setting (altsetting 1), even though
+   the CDC-ECM spec requires it. Work around this by forcing the switch
+   ourselves once the device reaches the CONFIGURED state, instead of waiting
+   for a host request that may never come. */
+static TX_THREAD force_alt_thread;
+static UCHAR force_alt_thread_stack[1024];
+static VOID force_alt_thread_entry(ULONG thread_input)
+{
+  UX_PARAMETER_NOT_USED(thread_input);
+
+  extern volatile ULONG dbg_counters[30];
+
+  for (;;)
+  {
+    tx_thread_sleep(20);
+    dbg_counters[8]++; /* poll tick counter, proves this thread is alive */
+
+    if (_ux_system_slave != UX_NULL)
+    {
+      dbg_counters[9] = _ux_system_slave->ux_system_slave_device.ux_slave_device_state;
+
+      if (_ux_system_slave->ux_system_slave_device.ux_slave_device_state == UX_DEVICE_CONFIGURED)
+      {
+        /* cdc_ecm_interface_number is the Communication interface number;
+           the Data interface (the one with the alternate-setting endpoints)
+           is the next one, matching what the host itself targets. */
+        printf("force_alt: device CONFIGURED, forcing itf=%lu alt=1\r\n", cdc_ecm_interface_number + 1);
+        _ux_device_stack_alternate_setting_set(cdc_ecm_interface_number + 1, 1);
+        return;
+      }
+    }
+  }
+}
+
+/* USER CODE BEGIN PV */
+/* ux app msg queue */
+TX_QUEUE     ux_app_MsgQueue;
+#if defined ( __ICCARM__ ) /* IAR Compiler */
+  #pragma data_alignment=4
+#endif /* defined ( __ICCARM__ ) */
+__ALIGN_BEGIN USB_MODE_STATE                  USB_Device_State_Msg   __ALIGN_END;
+/* USER CODE END PV */
+
+/* Private function prototypes -----------------------------------------------*/
+static VOID app_ux_device_thread_entry(ULONG thread_input);
+/* USER CODE BEGIN PFP */
+/* USER CODE END PFP */
+
+/**
+  * @brief  Application USBX Device Initialization.
+  * @param  memory_ptr: memory pointer
+  * @retval status
+  */
+UINT MX_USBX_Device_Init(VOID *memory_ptr)
+{
+  UINT ret = UX_SUCCESS;
+  UCHAR *pointer;
+  TX_BYTE_POOL *byte_pool = (TX_BYTE_POOL*)memory_ptr;
+
+  /* USER CODE BEGIN MX_USBX_Device_Init0 */
+
+  /* USER CODE END MX_USBX_Device_Init0 */
+
+  /* Perform the initialization of the network driver. This will initialize the
+     USBX network layer */
+
+  ux_network_driver_init();
+
+  /* Allocate the stack for device application main thread */
+  if (tx_byte_allocate(byte_pool, (VOID **) &pointer, UX_DEVICE_APP_THREAD_STACK_SIZE,
+                       TX_NO_WAIT) != TX_SUCCESS)
+  {
+    /* USER CODE BEGIN MAIN_THREAD_ALLOCATE_STACK_ERROR */
+    return TX_POOL_ERROR;
+    /* USER CODE END MAIN_THREAD_ALLOCATE_STACK_ERROR */
+  }
+
+  /* Create the device application main thread */
+  if (tx_thread_create(&ux_device_app_thread, UX_DEVICE_APP_THREAD_NAME, app_ux_device_thread_entry,
+                       0, pointer, UX_DEVICE_APP_THREAD_STACK_SIZE, UX_DEVICE_APP_THREAD_PRIO,
+                       UX_DEVICE_APP_THREAD_PREEMPTION_THRESHOLD, UX_DEVICE_APP_THREAD_TIME_SLICE,
+                       UX_DEVICE_APP_THREAD_START_OPTION) != TX_SUCCESS)
+  {
+    /* USER CODE BEGIN MAIN_THREAD_CREATE_ERROR */
+    return TX_THREAD_ERROR;
+    /* USER CODE END MAIN_THREAD_CREATE_ERROR */
+  }
+
+  /* USER CODE BEGIN MX_USBX_Device_Init1 */
+
+  /* Allocate Memory for the Queue */
+  if (tx_byte_allocate(byte_pool, (VOID **) &pointer,
+                       APP_QUEUE_SIZE*sizeof(ULONG),
+                       TX_NO_WAIT) != TX_SUCCESS)
+  {
+    return TX_POOL_ERROR;
+  }
+
+  /* Create the MsgQueue */
+  if (tx_queue_create(&ux_app_MsgQueue, "Message Queue app",
+                      TX_1_ULONG, pointer,
+                      APP_QUEUE_SIZE*sizeof(ULONG)) != TX_SUCCESS)
+  {
+    return TX_QUEUE_ERROR;
+  }
+
+  /* No USBPD/Type-C attach detection on this board: start the USB device
+     stack unconditionally, VBUS sensing is disabled in MX_USB_OTG_HS_PCD_Init(). */
+  {
+    USB_MODE_STATE start_msg = START_USB_DEVICE;
+    if (tx_queue_send(&ux_app_MsgQueue, &start_msg, TX_NO_WAIT) != TX_SUCCESS)
+    {
+      return TX_QUEUE_ERROR;
+    }
+  }
+
+  /* USER CODE END MX_USBX_Device_Init1 */
+
+  return ret;
+}
+
+/**
+  * @brief  Application USBX Device Initialization.
+  * @param  None
+  * @retval ret
+  */
+UINT MX_USBX_Device_Stack_Init(void)
+{
+  UINT ret = UX_SUCCESS;
+  UCHAR *device_framework_high_speed;
+  UCHAR *device_framework_full_speed;
+  ULONG device_framework_hs_length;
+  ULONG device_framework_fs_length;
+  ULONG string_framework_length;
+  ULONG language_id_framework_length;
+  UCHAR *string_framework;
+  UCHAR *language_id_framework;
+
+  /* USER CODE BEGIN MX_USBX_Device_Stack_Init_PreTreatment */
+
+  /* USER CODE END MX_USBX_Device_Stack_Init_PreTreatment */
+
+  /* Get Device Framework High Speed and get the length */
+  device_framework_high_speed = USBD_Get_Device_Framework_Speed(USBD_HIGH_SPEED,
+                                                                &device_framework_hs_length);
+
+  /* Get Device Framework Full Speed and get the length */
+  device_framework_full_speed = USBD_Get_Device_Framework_Speed(USBD_FULL_SPEED,
+                                                                &device_framework_fs_length);
+
+  /* Get String Framework and get the length */
+  string_framework = USBD_Get_String_Framework(&string_framework_length);
+
+  /* Get Language Id Framework and get the length */
+  language_id_framework = USBD_Get_Language_Id_Framework(&language_id_framework_length);
+
+  /* Install the device portion of USBX */
+  if (ux_device_stack_initialize(device_framework_high_speed,
+                                 device_framework_hs_length,
+                                 device_framework_full_speed,
+                                 device_framework_fs_length,
+                                 string_framework,
+                                 string_framework_length,
+                                 language_id_framework,
+                                 language_id_framework_length,
+                                 UX_NULL) != UX_SUCCESS)
+  {
+    /* USER CODE BEGIN USBX_DEVICE_INITIALIZE_ERROR */
+    return UX_ERROR;
+    /* USER CODE END USBX_DEVICE_INITIALIZE_ERROR */
+  }
+
+  /* Initialize the cdc ecm class parameters for the device */
+  cdc_ecm_parameter.ux_slave_class_cdc_ecm_instance_activate   = USBD_CDC_ECM_Activate;
+  cdc_ecm_parameter.ux_slave_class_cdc_ecm_instance_deactivate = USBD_CDC_ECM_Deactivate;
+
+  /* Get CDC ECM local MAC address */
+  USBD_CDC_ECM_GetMacAdd((uint8_t *)CDC_ECM_LOCAL_MAC_STR_DESC, cdc_ecm_local_nodeid);
+
+  /* Define CDC ECM local node id */
+  cdc_ecm_parameter.ux_slave_class_cdc_ecm_parameter_local_node_id[0] = cdc_ecm_local_nodeid[0];
+  cdc_ecm_parameter.ux_slave_class_cdc_ecm_parameter_local_node_id[1] = cdc_ecm_local_nodeid[1];
+  cdc_ecm_parameter.ux_slave_class_cdc_ecm_parameter_local_node_id[2] = cdc_ecm_local_nodeid[2];
+  cdc_ecm_parameter.ux_slave_class_cdc_ecm_parameter_local_node_id[3] = cdc_ecm_local_nodeid[3];
+  cdc_ecm_parameter.ux_slave_class_cdc_ecm_parameter_local_node_id[4] = cdc_ecm_local_nodeid[4];
+  cdc_ecm_parameter.ux_slave_class_cdc_ecm_parameter_local_node_id[5] = cdc_ecm_local_nodeid[5];
+
+  /* Get CDC ECM remote MAC address */
+  USBD_CDC_ECM_GetMacAdd((uint8_t *)CDC_ECM_REMOTE_MAC_STR_DESC, cdc_ecm_remote_nodeid);
+
+  /* Define CDC ECM remote node id */
+  cdc_ecm_parameter.ux_slave_class_cdc_ecm_parameter_remote_node_id[0] = cdc_ecm_remote_nodeid[0];
+  cdc_ecm_parameter.ux_slave_class_cdc_ecm_parameter_remote_node_id[1] = cdc_ecm_remote_nodeid[1];
+  cdc_ecm_parameter.ux_slave_class_cdc_ecm_parameter_remote_node_id[2] = cdc_ecm_remote_nodeid[2];
+  cdc_ecm_parameter.ux_slave_class_cdc_ecm_parameter_remote_node_id[3] = cdc_ecm_remote_nodeid[3];
+  cdc_ecm_parameter.ux_slave_class_cdc_ecm_parameter_remote_node_id[4] = cdc_ecm_remote_nodeid[4];
+  cdc_ecm_parameter.ux_slave_class_cdc_ecm_parameter_remote_node_id[5] = cdc_ecm_remote_nodeid[5];
+
+  /* USER CODE BEGIN CDC_ECM_PARAMETER */
+
+  /* USER CODE END CDC_ECM_PARAMETER */
+
+  /* Get cdc ecm configuration number */
+  cdc_ecm_configuration_number = USBD_Get_Configuration_Number(CLASS_TYPE_CDC_ECM, 0);
+
+  /* Find cdc ecm interface number */
+  cdc_ecm_interface_number = USBD_Get_Interface_Number(CLASS_TYPE_CDC_ECM, 0);
+
+  /* Initialize the device cdc ecm class */
+  if (ux_device_stack_class_register(_ux_system_slave_class_cdc_ecm_name,
+                                     ux_device_class_cdc_ecm_entry,
+                                     cdc_ecm_configuration_number,
+                                     cdc_ecm_interface_number,
+                                     &cdc_ecm_parameter) != UX_SUCCESS)
+  {
+    /* USER CODE BEGIN USBX_DEVICE_CDC_ECM_REGISTER_ERROR */
+    return UX_ERROR;
+    /* USER CODE END USBX_DEVICE_CDC_ECM_REGISTER_ERROR */
+  }
+
+  /* Initialize and link controller HAL driver */
+  ux_dcd_stm32_initialize((ULONG)USB_OTG_HS, (ULONG)&hpcd_USB_OTG_HS);
+
+  /* USER CODE BEGIN MX_USBX_Device_Stack_Init_PostTreatment */
+
+  /* USER CODE END MX_USBX_Device_Stack_Init_PostTreatment */
+
+return ret;
+
+}
+
+/**
+  * @brief MX_USBX_Device_Stack_DeInit
+  *        Uninitialization of USB Device.
+  * uninitialize the device stack, unregister of device class stack
+  * unregister of the usb device controller
+  * @param  None
+  * @retval ret
+  */
+UINT MX_USBX_Device_Stack_DeInit(void)
+{
+  UINT ret = UX_SUCCESS;
+
+  /* USER CODE BEGIN MX_USBX_Device_Stack_DeInit_PreTreatment */
+
+  /* USER CODE END MX_USBX_Device_Stack_DeInit_PreTreatment */
+
+  /* Uninitialize and unlink controller HAL driver */
+  ux_dcd_stm32_uninitialize((ULONG)USB_OTG_HS, (ULONG)&hpcd_USB_OTG_HS);
+
+  /* Unregister CDC ECM class. */
+  if (ux_device_stack_class_unregister(_ux_system_slave_class_cdc_ecm_name,
+                                     ux_device_class_cdc_ecm_entry) != UX_SUCCESS)
+  {
+    return UX_ERROR;
+  }
+
+  /* The code below is required for uninstalling the device portion of USBX.  */
+  if (ux_device_stack_uninitialize() != UX_SUCCESS)
+  {
+    return UX_ERROR;
+  }
+
+  /* USER CODE BEGIN MX_USBX_Device_Stack_DeInit_PostTreatment */
+
+  /* USER CODE END MX_USBX_Device_Stack_DeInit_PostTreatment */
+
+  return ret;
+}
+
+/**
+  * @brief  Function implementing app_ux_device_thread_entry.
+  * @param  thread_input: User thread input parameter.
+  * @retval none
+  */
+static VOID app_ux_device_thread_entry(ULONG thread_input)
+{
+  /* USER CODE BEGIN app_ux_device_thread_entry */
+
+  /* Wait for message queue to start/stop the device */
+  while(1)
+  {
+    /* Wait for a device to be connected */
+    if (tx_queue_receive(&ux_app_MsgQueue, &USB_Device_State_Msg,
+                         TX_WAIT_FOREVER)!= TX_SUCCESS)
+    {
+      /*Error*/
+      Error_Handler();
+    }
+    /* Check if received message equal to USB_PCD_START */
+    if (USB_Device_State_Msg == START_USB_DEVICE)
+    {
+
+      /* USB_OTG_HS init function */
+      MX_USB_OTG_HS_PCD_Init();
+      printf("USBX: OTG_HS PCD initialized\r\n");
+
+      if (MX_USBX_Device_Stack_Init() != UX_SUCCESS)
+      {
+        /* USER CODE BEGIN MAIN_INITIALIZE_STACK_ERROR */
+        printf("USBX: MX_USBX_Device_Stack_Init FAILED\r\n");
+        Error_Handler();
+        /* USER CODE END MAIN_INITIALIZE_STACK_ERROR */
+      }
+      printf("USBX: device stack initialized, CDC-ECM class registered\r\n");
+
+      /* Start the USB device */
+      HAL_PCD_Start(&hpcd_USB_OTG_HS);
+      printf("USBX: PCD started, device now enumerable\r\n");
+
+      /* Start the workaround thread that forces the CDC-ECM data altsetting
+         active once enumeration completes (see force_alt_thread_entry). */
+      tx_thread_create(&force_alt_thread, "force_alt", force_alt_thread_entry, 0,
+                        force_alt_thread_stack, sizeof(force_alt_thread_stack),
+                        20, 20, TX_NO_TIME_SLICE, TX_AUTO_START);
+    }
+    /* Check if received message equal to USB_PCD_STOP */
+    else if (USB_Device_State_Msg == STOP_USB_DEVICE)
+    {
+      /* Disconnect USBX stack driver,  */
+      ux_device_stack_disconnect();
+
+      /* Stop the device USB */
+      HAL_PCD_Stop(&hpcd_USB_OTG_HS);
+
+      /* Deinitialize the Stack USB Device*/
+      if (MX_USBX_Device_Stack_DeInit() != UX_SUCCESS)
+      {
+        /* USER CODE BEGIN MAIN_UNINITIALIZE_STACK_ERROR */
+        Error_Handler();
+        /* USER CODE END MAIN_UNINITIALIZE_STACK_ERROR */
+      }
+
+      /* USB_OTG_HS deinit function */
+      HAL_PCD_DeInit(&hpcd_USB_OTG_HS);
+    }
+    /* Else Error */
+    else
+    {
+      /*Error*/
+      Error_Handler();
+    }
+  }
+
+  /* USER CODE END app_ux_device_thread_entry */
+}
+
+/* USER CODE BEGIN 2 */
+
+
+/* USER CODE END 2 */
